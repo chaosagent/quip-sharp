@@ -8,6 +8,9 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <cuda/barrier>
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
 
 #include <ATen/ATen.h>
 #include <ATen/Context.h>
@@ -21,6 +24,7 @@
 
 using namespace torch::indexing;
 using namespace nvcuda;
+namespace cg = cooperative_groups;
 
 #define FULL_MASK 0xffffffff
 #define HALF_MASK 0x0000ffff
@@ -92,6 +96,8 @@ decode_matmul_e8p_kernel(
     int64_t N,
     int64_t K
 ) {
+    auto block = cooperative_groups::this_thread_block();
+    cg::thread_block_tile<32> tile32 = cooperative_groups::tiled_partition<32>(block);
     __shared__ int64_t codebook_local[256];
     if (threadIdx.x < 256) {
     codebook_local[threadIdx.x] = codebook_abs[threadIdx.x];
@@ -147,12 +153,20 @@ decode_matmul_e8p_kernel(
                 }
             }
         }
+        __shared__ int16_t loaded_weights[unroll_k * BLOCK_SIZE];
         for (int64_t unroll_n_i = 0; unroll_n_i < unroll_n; unroll_n_i++) {
             scalar_t accumulator = 0;
             int64_t n = ((warpPos/local_k) % local_n) + ((warpPos / warps_per_elem) % grid_N) / local_n * local_n;
             __syncwarp();
             uint16_t this_weights[unroll_k];
-            if (unroll_k % 2 == 0) {
+            if (false) {
+                cg::memcpy_async(tile32, loaded_weights + unroll_k * warpId * WARP_SIZE, &weights_compressed[(n*unroll_n + unroll_n_i) * K/pack + (k * WARP_SIZE) * unroll_k], unroll_k * WARP_SIZE * sizeof(uint16_t));
+                cg::wait(tile32);
+#pragma unroll
+                for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i++) {
+                    this_weights[unroll_k_i] = loaded_weights[unroll_k * warpId * WARP_SIZE + laneId * unroll_k + unroll_k_i];
+                }
+            } else if (unroll_k % 2 == 0) {
                 for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i+=2) {
                     const ushort2 *loaded = (const ushort2 *) &weights_compressed[(n*unroll_n + unroll_n_i) * K/pack + (k * WARP_SIZE + laneId) * unroll_k + unroll_k_i];
                     __builtin_assume_aligned(loaded, 4);
