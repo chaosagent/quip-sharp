@@ -506,12 +506,12 @@ decode_matmul_e8p_kernel(
     int64_t laneId = threadIdx.x % WARP_SIZE;
 
     // each thread adds 8 activation-weight products
-    int64_t unroll_k = 2;
-    int64_t pack = 8;
-    int64_t elem_per_thread = pack * unroll_k;
+    const int64_t unroll_k = 2;
+    const int64_t pack = 8;
+    const int64_t elem_per_thread = pack * unroll_k;
     int64_t warps_per_elem = K / WARP_SIZE / elem_per_thread;
-    int64_t unroll_n = 16;
-    int64_t local_k = 1; // in terms of warp size. 32 threads of elem_per_thread fma each, dont set below 1 because of __shfl_down_sync
+    const int64_t unroll_n = 16;
+    const int64_t local_k = 1; // in terms of warp size. 32 threads of elem_per_thread fma each, dont set below 1 because of __shfl_down_sync
     int64_t local_n = BLOCK_SIZE / WARP_SIZE / local_k;
     int64_t grid_N = N / unroll_n;
 
@@ -528,35 +528,57 @@ decode_matmul_e8p_kernel(
         int64_t k_ = warpPos % (warps_per_elem * local_n);
         int64_t k = k_ / (local_k * local_n) * local_k + k_ % local_k;
 
+        scalar_t this_activations[elem_per_thread];
 #pragma unroll
+        for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i++) {
+            const scalar_t *activations = x + m * K + (k * WARP_SIZE + laneId) * elem_per_thread + unroll_k_i * pack;
+            if constexpr (std::is_same<scalar_t, float>::value) {
+                const float4 *first_half = reinterpret_cast<const float4 *>(activations);
+                __builtin_assume_aligned(first_half, 16);
+                this_activations[unroll_k_i * pack + 0] = first_half->x;
+                this_activations[unroll_k_i * pack + 1] = first_half->y;
+                this_activations[unroll_k_i * pack + 2] = first_half->z;
+                this_activations[unroll_k_i * pack + 3] = first_half->w;
+                const float4 *second_half = reinterpret_cast<const float4 *>(activations + 4);
+                __builtin_assume_aligned(second_half, 16);
+                this_activations[unroll_k_i * pack + 4] = second_half->x;
+                this_activations[unroll_k_i * pack + 5] = second_half->y;
+                this_activations[unroll_k_i * pack + 6] = second_half->z;
+                this_activations[unroll_k_i * pack + 7] = second_half->w;
+            } else {
+                for (int64_t activation_i = 0; activation_i < pack; activation_i++) {
+                    this_activations[unroll_k_i * pack + activation_i] = activations[activation_i];
+                }
+            }
+        }
         for (int64_t unroll_n_i = 0; unroll_n_i < unroll_n; unroll_n_i++) {
             scalar_t accumulator = 0;
             int64_t n = ((warpPos/local_k) % local_n) + ((warpPos / warps_per_elem) % grid_N) / local_n * local_n;
             __syncwarp();
+            uint16_t this_weights[unroll_k];
+            if (unroll_k % 2 == 0) {
+                for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i+=2) {
+                    const ushort2 *loaded = (const ushort2 *) &weights_compressed[(n*unroll_n + unroll_n_i) * K/pack + (k * WARP_SIZE + laneId) * unroll_k + unroll_k_i];
+                    __builtin_assume_aligned(loaded, 4);
+                    this_weights[unroll_k_i] = loaded->x;
+                    this_weights[unroll_k_i + 1] = loaded->y;
+                }
+            } else {
+                for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i++) {
+                    this_weights[unroll_k_i] = weights_compressed[(n*unroll_n + unroll_n_i) * K/pack + (k * WARP_SIZE + laneId) * unroll_k + unroll_k_i];
+                }
+            }
+
 #pragma unroll
             for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i++) {
                 // TODO: optimize access pattern by reordering weights
-                const scalar_t *activations = x + m * K + (k * WARP_SIZE + laneId) * elem_per_thread + unroll_k_i * pack;
-                uint16_t encoded = weights_compressed[(n*unroll_n + unroll_n_i) * K/pack + (k * WARP_SIZE + laneId) * unroll_k + unroll_k_i];
+                uint16_t encoded = this_weights[unroll_k_i];
                 uint64_t decoded = decode8weights(encoded, codebook_local);
 
-                if constexpr (std::is_same<scalar_t, float>::value) {
-                    const float4 *first_half = reinterpret_cast<const float4 *>(activations);
-                    accumulator += first_half->x * static_cast<int8_t>(decoded >> 0);
-                    accumulator += first_half->y * static_cast<int8_t>(decoded >> 8);
-                    accumulator += first_half->z * static_cast<int8_t>(decoded >> 16);
-                    accumulator += first_half->w * static_cast<int8_t>(decoded >> 24);
-                    const float4 *second_half = reinterpret_cast<const float4 *>(activations + 4);
-                    accumulator += second_half->x * static_cast<int8_t>(decoded >> 32);
-                    accumulator += second_half->y * static_cast<int8_t>(decoded >> 40);
-                    accumulator += second_half->z * static_cast<int8_t>(decoded >> 48);
-                    accumulator += second_half->w * static_cast<int8_t>(decoded >> 56);
-                } else {
 #pragma unroll
-                    for (int64_t i = 0; i < 8; i += 1) {
-                        int8_t weight = decoded >> (i * 8);
-                        accumulator += activations[i] * weight;
-                    }
+                for (int64_t i = 0; i < 8; i += 1) {
+                    int8_t weight = decoded >> (i * 8);
+                    accumulator += this_activations[unroll_k_i * pack + i] * (int8_t) weight;
                 }
             }
             accumulator *= 0.25;
