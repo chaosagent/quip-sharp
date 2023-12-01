@@ -171,11 +171,43 @@ decode_matmul_e8p_kernel(
                 uint16_t encoded = this_weights[unroll_k_i];
                 uint64_t decoded = decode8weights(encoded, codebook_local);
 
-#pragma unroll
+                #ifdef EMULATED_INT82FP16
+                // bit twiddling to convert int8 to fp16 from http://arxiv.org/abs/2211.10017
+                half2 unpacked[2][2];
+                uint64_t lower_half = decoded & 0x00ff00ff00ff00ff;
+                lower_half = (lower_half ^ 0x6480648064806480);
+                memcpy(unpacked[0], &lower_half, sizeof(uint64_t));
+                uint64_t upper_half = (decoded & 0xff00ff00ff00ff00) >> 8;
+                upper_half = (upper_half ^ 0x6480648064806480);
+                memcpy(unpacked[1], &upper_half, sizeof(uint64_t));
+
+                const half2 adjust = {__float2half(-1152.0f), __float2half(-1152.0f)};
+                unpacked[0][0] = __hadd2(unpacked[0][0], adjust);
+                unpacked[0][1] = __hadd2(unpacked[0][1], adjust);
+                unpacked[1][0] = __hadd2(unpacked[1][0], adjust);
+                unpacked[1][1] = __hadd2(unpacked[1][1], adjust);
+
+                float2 unpacked_f[2][2];
+                unpacked_f[0][0] = __half22float2(unpacked[0][0]);
+                unpacked_f[0][1] = __half22float2(unpacked[0][1]);
+                unpacked_f[1][0] = __half22float2(unpacked[1][0]);
+                unpacked_f[1][1] = __half22float2(unpacked[1][1]);
+
+
+                accumulator += this_activations[unroll_k_i * pack + 0] * (unpacked_f[0][0].x);
+                accumulator += this_activations[unroll_k_i * pack + 1] * (unpacked_f[1][0].x);
+                accumulator += this_activations[unroll_k_i * pack + 2] * (unpacked_f[0][0].y);
+                accumulator += this_activations[unroll_k_i * pack + 3] * (unpacked_f[1][0].y);
+                accumulator += this_activations[unroll_k_i * pack + 4] * (unpacked_f[0][1].x);
+                accumulator += this_activations[unroll_k_i * pack + 5] * (unpacked_f[1][1].x);
+                accumulator += this_activations[unroll_k_i * pack + 6] * (unpacked_f[0][1].y);
+                accumulator += this_activations[unroll_k_i * pack + 7] * (unpacked_f[1][1].y);
+                #else
                 for (int64_t i = 0; i < 8; i += 1) {
                     int8_t weight = decoded >> (i * 8);
                     accumulator += this_activations[unroll_k_i * pack + i] * (int8_t) weight;
                 }
+                #endif
             }
             accumulator *= 0.25;
 
