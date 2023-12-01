@@ -76,6 +76,7 @@ __device__ static inline uint64_t decode8weights(
 }
 
 
+#define LOCAL_CODEBOOK true
 /*
 llama 2 70B:
 M N K
@@ -98,11 +99,14 @@ decode_matmul_e8p_kernel(
 ) {
     auto block = cooperative_groups::this_thread_block();
     cg::thread_block_tile<32> tile32 = cooperative_groups::tiled_partition<32>(block);
+
+#if LOCAL_CODEBOOK
     __shared__ int64_t codebook_local[256];
     if (threadIdx.x < 256) {
     codebook_local[threadIdx.x] = codebook_abs[threadIdx.x];
     }
     __syncthreads();
+#endif
 
     int64_t warpId = threadIdx.x / WARP_SIZE;
     int64_t laneId = threadIdx.x % WARP_SIZE;
@@ -117,9 +121,6 @@ decode_matmul_e8p_kernel(
     int64_t local_n = BLOCK_SIZE / WARP_SIZE / local_k;
     int64_t grid_N = N / unroll_n;
 
-    __shared__ scalar_t accum_scratch[BLOCK_SIZE / WARP_SIZE];
-    bool SHARED_REDUCE = false;
-
     for (int64_t warpPos = blockIdx.x * BLOCK_SIZE/WARP_SIZE + warpId;
             warpPos < M * grid_N * warps_per_elem;
             warpPos += gridDim.x * BLOCK_SIZE/WARP_SIZE) {
@@ -130,43 +131,36 @@ decode_matmul_e8p_kernel(
         int64_t k_ = warpPos % (warps_per_elem * local_n);
         int64_t k = k_ / (local_k * local_n) * local_k + k_ % local_k;
 
-        scalar_t this_activations[elem_per_thread];
-#pragma unroll
-        for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i++) {
-            const scalar_t *activations = x + m * K + (k * WARP_SIZE + laneId) * elem_per_thread + unroll_k_i * pack;
-            if constexpr (std::is_same<scalar_t, float>::value) {
-                const float4 *first_half = reinterpret_cast<const float4 *>(activations);
-                __builtin_assume_aligned(first_half, 16);
-                this_activations[unroll_k_i * pack + 0] = first_half->x;
-                this_activations[unroll_k_i * pack + 1] = first_half->y;
-                this_activations[unroll_k_i * pack + 2] = first_half->z;
-                this_activations[unroll_k_i * pack + 3] = first_half->w;
-                const float4 *second_half = reinterpret_cast<const float4 *>(activations + 4);
-                __builtin_assume_aligned(second_half, 16);
-                this_activations[unroll_k_i * pack + 4] = second_half->x;
-                this_activations[unroll_k_i * pack + 5] = second_half->y;
-                this_activations[unroll_k_i * pack + 6] = second_half->z;
-                this_activations[unroll_k_i * pack + 7] = second_half->w;
-            } else {
-                for (int64_t activation_i = 0; activation_i < pack; activation_i++) {
-                    this_activations[unroll_k_i * pack + activation_i] = activations[activation_i];
+        const scalar_t *activations = x + m * K + (k * WARP_SIZE + laneId) * elem_per_thread;
+        __shared__ scalar_t this_activations[elem_per_thread][WARP_SIZE * local_k];
+        if (local_n_i == 0) {
+            for (int64_t unroll_k_i=0; unroll_k_i < unroll_k; unroll_k_i++) {
+                for (int64_t i = 0; i < pack; i++) {
+                    this_activations[unroll_k_i * pack + i][local_k_i * WARP_SIZE + laneId] = activations[unroll_k_i * pack + i];
                 }
             }
         }
-        __shared__ int16_t loaded_weights[unroll_k * BLOCK_SIZE];
+
+        //cg::memcpy_async(block, this_activations, activations, elem_per_thread * WARP_SIZE * local_k * sizeof(scalar_t));
+        cg::wait(block);
+
+        __shared__ int16_t loaded_weights[2][unroll_k * BLOCK_SIZE];
+        int64_t n = ((warpPos/local_k) % local_n) + ((warpPos / warps_per_elem) % grid_N) / local_n * local_n;
+        cg::memcpy_async(tile32, loaded_weights[0] + unroll_k * warpId * WARP_SIZE, &weights_compressed[(n*unroll_n + (0)) * K/pack + (k * WARP_SIZE) * unroll_k], unroll_k * WARP_SIZE * sizeof(uint16_t));
         for (int64_t unroll_n_i = 0; unroll_n_i < unroll_n; unroll_n_i++) {
             scalar_t accumulator = 0;
-            int64_t n = ((warpPos/local_k) % local_n) + ((warpPos / warps_per_elem) % grid_N) / local_n * local_n;
-            __syncwarp();
             uint16_t this_weights[unroll_k];
-            if (false) {
-                cg::memcpy_async(tile32, loaded_weights + unroll_k * warpId * WARP_SIZE, &weights_compressed[(n*unroll_n + unroll_n_i) * K/pack + (k * WARP_SIZE) * unroll_k], unroll_k * WARP_SIZE * sizeof(uint16_t));
+            if (true) {
                 cg::wait(tile32);
-#pragma unroll
+                #pragma unroll
                 for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i++) {
-                    this_weights[unroll_k_i] = loaded_weights[unroll_k * warpId * WARP_SIZE + laneId * unroll_k + unroll_k_i];
+                    this_weights[unroll_k_i] = loaded_weights[unroll_n_i%2][unroll_k * warpId * WARP_SIZE + laneId * unroll_k + unroll_k_i];
+                }
+                if (unroll_n_i + 1 < unroll_n) {
+                    cg::memcpy_async(tile32, loaded_weights[(unroll_n_i + 1)%2] + unroll_k * warpId * WARP_SIZE, &weights_compressed[(n*unroll_n + (unroll_n_i + 1)) * K/pack + (k * WARP_SIZE) * unroll_k], unroll_k * WARP_SIZE * sizeof(uint16_t));
                 }
             } else if (unroll_k % 2 == 0) {
+                __syncwarp();
                 for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i+=2) {
                     const ushort2 *loaded = (const ushort2 *) &weights_compressed[(n*unroll_n + unroll_n_i) * K/pack + (k * WARP_SIZE + laneId) * unroll_k + unroll_k_i];
                     __builtin_assume_aligned(loaded, 4);
@@ -174,6 +168,7 @@ decode_matmul_e8p_kernel(
                     this_weights[unroll_k_i + 1] = loaded->y;
                 }
             } else {
+                __syncwarp();
                 for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i++) {
                     this_weights[unroll_k_i] = weights_compressed[(n*unroll_n + unroll_n_i) * K/pack + (k * WARP_SIZE + laneId) * unroll_k + unroll_k_i];
                 }
@@ -183,12 +178,17 @@ decode_matmul_e8p_kernel(
             for (int64_t unroll_k_i = 0; unroll_k_i < unroll_k; unroll_k_i++) {
                 // TODO: optimize access pattern by reordering weights
                 uint16_t encoded = this_weights[unroll_k_i];
+#if LOCAL_CODEBOOK
                 uint64_t decoded = decode8weights(encoded, codebook_local);
+#else
+                uint64_t decoded = decode8weights(encoded, codebook_abs);
+#endif
 
 #pragma unroll
                 for (int64_t i = 0; i < 8; i += 1) {
                     int8_t weight = decoded >> (i * 8);
-                    accumulator += this_activations[unroll_k_i * pack + i] * (int8_t) weight;
+                    // accumulator += this_activations[local_k_i * WARP_SIZE * elem_per_thread + laneId * elem_per_thread + unroll_k_i * pack + i] * (int8_t) weight;
+                    accumulator += this_activations[unroll_k_i * pack + i][local_k_i * WARP_SIZE + laneId] * (int8_t) weight;
                 }
             }
             accumulator *= 0.25;
@@ -203,24 +203,8 @@ decode_matmul_e8p_kernel(
                 }
             }
 
-            if (SHARED_REDUCE) {
-                if (laneId == 0) {
-                    accum_scratch[warpId] = accumulator;
-                    __syncthreads();
-                    if (warpId % local_k == 0) {
-                        scalar_t local_accum = 0;
-                        for (int64_t accum_i = 0; accum_i < local_k; accum_i++) {
-                            local_accum += accum_scratch[warpId / local_k * local_k + accum_i];
-                        }
-                        atomicAdd(output + m * N + n * unroll_n + unroll_n_i, local_accum);
-                    }
-                } else {
-                    __syncthreads();
-                }
-            } else {
-                if (laneId == 0) {
-                    atomicAdd(output + m * N + n * unroll_n + unroll_n_i, accumulator);
-                }
+            if (laneId == 0) {
+                atomicAdd(output + m * N + n * unroll_n + unroll_n_i, accumulator);
             }
         }
     }
@@ -268,6 +252,7 @@ __host__ extern torch::Tensor decode_matmul_e8p(
             x.scalar_type(),
             "decode_matmul_e8p",
             [&] {
+        cudaFuncSetAttribute(decode_matmul_e8p_kernel<scalar_t>, cudaFuncAttributePreferredSharedMemoryCarveout, 80);
         decode_matmul_e8p_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
                 output.data_ptr<scalar_t>(),
                 x.data_ptr<scalar_t>(),
