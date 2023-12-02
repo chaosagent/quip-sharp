@@ -57,11 +57,10 @@ __device__ static inline uint64_t decode8weights(
 
     // TODO: optimize this by redefining the bit pattern
     bool parity = __popcll(packed & 0x0404040404040404) % 2 == 0;
-    uint64_t decoded_sign = __brev(bits_sign | (((__popc(bits_sign) & 1) == parity) << 7)) >> 24;
-    decoded_sign |= (decoded_sign << (32-4));
-    decoded_sign |= (decoded_sign << (16-2));
-    decoded_sign |= (decoded_sign << (8-1));
-    decoded_sign &= 0x0101010101010101;
+    uint8_t sign_vec = bits_sign | (((__popc(bits_sign) & 1) == parity) << 7);
+    uint64_t decoded_sign = sign_vec * 0x8040201008040201ll;
+    decoded_sign &= 0x8080808080808080;
+    decoded_sign >>= 7;
     decoded_sign *= 255 - 3;
     packed ^= decoded_sign;
 
