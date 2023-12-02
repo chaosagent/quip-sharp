@@ -49,7 +49,7 @@ __device__ static inline uint64_t decode8weights(
     const int64_t *__restrict__ codebook_abs
 ) {
 
-    bool bit_shift = !(weight_compressed & 1);
+    uint32_t bit_shift = (weight_compressed & 1)^1;
     uint8_t bits_sign = (weight_compressed >> 1) & ((1 << 7) - 1);
     uint8_t bits_abs = (weight_compressed >> 8) & ((1 << 9) - 1);
 
