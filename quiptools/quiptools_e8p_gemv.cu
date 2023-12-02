@@ -53,22 +53,32 @@ __device__ static inline uint64_t decode8weights(
     uint8_t bits_sign = (weight_compressed >> 1) & ((1 << 7) - 1);
     uint8_t bits_abs = (weight_compressed >> 8) & ((1 << 9) - 1);
 
-    int64_t packed = codebook_abs[bits_abs];
+    int64_t packed_ = codebook_abs[bits_abs];
+    uint32_t packed[2];
+    memcpy(packed, &packed_, sizeof(packed));
 
     // TODO: optimize this by redefining the bit pattern
-    uint8_t parity = __popcll(packed & 0x0404040404040404) % 2 != 0;
-    uint8_t sign_vec = bits_sign | ((((uint8_t)__popc(bits_sign)) ^ parity) << 7);
-    uint64_t decoded_sign = sign_vec * 0x8040201008040201ll;
-    decoded_sign &= 0x8080808080808080;
-    decoded_sign >>= 7;
-    decoded_sign *= 255 - 3;
-    packed ^= decoded_sign;
-    packed |= 0x0101010101010101;
+    uint32_t parity = __popc(packed[0] & 0x04040404) ^ __popc(packed[1]&0x04040404);
+    uint8_t sign_vec = bits_sign | ((__popc(bits_sign) ^ parity) << 7);
+    uint32_t decoded_sign[2];
+    decoded_sign[0] = sign_vec * 0x08040201ll;
+    decoded_sign[1] = sign_vec * 0x80402010ll;
+    decoded_sign[0] &= 0x80808080;
+    decoded_sign[1] &= 0x80808080;
+    decoded_sign[0] >>= 7;
+    decoded_sign[1] >>= 7;
+    decoded_sign[0] *= 255 - 3;
+    decoded_sign[1] *= 255 - 3;
+    packed[0] ^= decoded_sign[0];
+    packed[1] ^= decoded_sign[1];
+    packed[0] |= 0x01010101;
+    packed[1] |= 0x01010101;
+    packed[0] -= bit_shift * 0x02020202;
+    packed[1] -= bit_shift * 0x02020202;
 
-    packed -= bit_shift * 0x0202020202020202;
-    packed |= 0x0101010101010101;
+    memcpy(&packed_, packed, sizeof(packed));
 
-    return packed;
+    return packed_;
 }
 
 
